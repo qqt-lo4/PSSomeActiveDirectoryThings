@@ -313,11 +313,6 @@ function Export-ADSecurityReport {
         # in-scope domains, the upper-cased ancestor DN set used by
         # the per-domain Phase 2 to filter GPO Links to OUs touching
         # this perim, and the slug-cased tab id.
-        function Get-PerimTabId {
-            Param([string]$Name)
-            return (($Name -replace '[^\w]', '-').Trim('-').ToLower())
-        }
-
         $hPerimData = [ordered]@{}
         if ($bScoped) {
             Write-Progress -Activity $sCallerName -Status "Resolving perimeters..." -PercentComplete 5
@@ -366,7 +361,7 @@ function Export-ADSecurityReport {
                 }
 
                 $hPerimData[$sPerimName] = @{
-                    Tab          = Get-PerimTabId $sPerimName
+                    Tab          = $sPerimName
                     Identities   = $aIds
                     Objects      = $aObjects
                     ScopeDomains = $hScopeDom
@@ -417,7 +412,6 @@ function Export-ADSecurityReport {
         # against $hPerimeterAncestors continue to work for the
         # unscoped path (Ancestors is empty so nothing is filtered out)
         # and for the single-perim case (where the union IS the perim).
-        $aPerimeterObjects = @($hPerimData.Values | ForEach-Object { $_.Objects } | Where-Object { $_ })
         $hPerimeterAncestors = @{}
         foreach ($oPerim in $hPerimData.Values) {
             foreach ($sKey in $oPerim.Ancestors.Keys) { $hPerimeterAncestors[$sKey] = $true }
@@ -519,6 +513,14 @@ function Export-ADSecurityReport {
 
         # ===== SECURITY POLICIES (Password & Account Lockout) =====
         if ($IncludeSecurityPolicies) {
+            # Inventory leads: it defines the audit scope (the in-scope
+            # population per perimeter), which an assessor reviews before the
+            # per-perimeter security posture. Groups one (perim, objectclass)
+            # sub-section per perim so every perim's users / computers stay
+            # column-typed. Added before the perimeter tabs so it renders first.
+            $sInventoryTab = "Inventory"
+            if ($sInventoryTab -notin $aTabs) { $aTabs += $sInventoryTab }
+
             # One tab per perimeter: each carries that perimeter's
             # Default Password Policy / PSO / OU Stats / GPO Links /
             # WMI Filters per domain. The unscoped pseudo-perim is
@@ -528,22 +530,10 @@ function Export-ADSecurityReport {
                 if ($oPerim.Tab -notin $aTabs) { $aTabs += $oPerim.Tab }
             }
 
-            # Global tabs. Inventory groups one (perim, objectclass)
-            # sub-section per perim so every perim's users / computers
-            # stay column-typed. GPO Catalog hosts the cross-domain
-            # deduplicated per-GPO panels and the cross-tab WSUS pivot.
-            $sInventoryTab = "inventory"
-            if ($sInventoryTab -notin $aTabs) { $aTabs += $sInventoryTab }
-
-            $sGPOTab = "gpo"
+            # GPO Catalog hosts the cross-domain deduplicated per-GPO panels
+            # and the cross-tab WSUS pivot; trailing global tab.
+            $sGPOTab = "GPO"
             if ($sGPOTab -notin $aTabs) { $aTabs += $sGPOTab }
-
-            # $sSecurityTab retained as the legacy single-tab id used
-            # by the Phase 2 emissions below. We override it inside
-            # the per-perim emission loops to route each section to
-            # the correct perim tab. In unscoped mode it stays the
-            # synthesised "security" tab throughout.
-            $sSecurityTab = @($hPerimData.Values)[0].Tab
 
             # Forest-wide map of unique GPO panels, keyed by
             # "<DisplayName>|<fingerprint>" so identical replicas across

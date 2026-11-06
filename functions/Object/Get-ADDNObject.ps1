@@ -26,6 +26,11 @@ function Get-ADDNObject {
     .PARAMETER UseGlobalCatalog
         If specified, uses the Global Catalog (GC://). Aliases: GC, GlobalCatalog.
 
+    .PARAMETER SearchScope
+        Directory search scope forwarded to Get-ADObject. Default: Base
+        (returns only the entries named by the DNs). Pass Subtree when the
+        goal is "resolve these DNs AND everything underneath them".
+
     .OUTPUTS
         Custom AD object(s) resolved from the DN list.
 
@@ -35,8 +40,42 @@ function Get-ADDNObject {
 
     .NOTES
         Author  : Loïc Ade
-        Version : 1.0.0
-        Version 1.0: First version
+        Version : 2.1.0
+
+        CHANGELOG:
+
+        Version 2.1.0 - 2026-07-10 - Loïc Ade
+            - New -SearchScope parameter (no default). Forwarded to
+              Get-ADObject only when the caller explicitly sets it, so
+              Get-ADObject applies its own per-mode default: Base for the
+              single-DN fast path (avoids pulling every descendant of the
+              resolved entry - a user's ExchangeActiveSyncDevices, etc.),
+              Subtree for the batch-DN path (whose filter needs to see the
+              whole domain subtree, otherwise every multi-member group
+              came back empty). Callers wanting descendants of a specific
+              DN pass -SearchScope Subtree explicitly.
+            - Isolate per-domain failures. An unreachable trusted subdomain
+              made Get-ADObject throw "cannot invoke method on null-valued
+              expression" (defaultNamingContext[0].ToString() on an empty
+              RootDSE response), which propagated out and killed the whole
+              caller (Get-GroupMembers dropped every member of any group
+              whose DN list spanned a reachable and an unreachable domain).
+              A try/catch around the per-domain lookup logs a warning
+              naming the domain and continues with the other domains.
+
+        Version 2.0.0 - 2026-06-16 - Loïc Ade
+            - Refactored as a thin wrapper around Get-ADObject (now that it accepts a
+              batch [string[]] -Identity). DNs are grouped by domain and each group is
+              resolved by one Get-ADObject call. Removes the duplicate, divergent
+              object builder: resolved objects are now ordinary Get-ADObject objects
+              (hashtable shape, Refresh(), full PSTypeNames including "ADObject").
+              Fixes drilled-in views (e.g. a managed user opened from "List managed
+              users") where computed attributes silently came back empty and the
+              logon-status tests threw, because the old PSCustomObject lacked the
+              "ADObject" type token and could not accept lazily-added properties.
+
+        Version 1.0.0 - Loïc Ade
+            - First version.
     #>
     
     Param(
@@ -57,86 +96,54 @@ function Get-ADDNObject {
         [string[]]$DN,
 
         [Alias("GC", "GlobalCatalog")]
-        [switch]$UseGlobalCatalog
+        [switch]$UseGlobalCatalog,
+
+        # Forwarded to Get-ADObject when explicitly set. Get-ADObject picks a
+        # sensible default per-call: Base for its single-DN fast path (avoids
+        # pulling every child under the resolved entry - a user's
+        # ExchangeActiveSyncDevices, an OU's children, ...), and Subtree for
+        # the batch-DN path (whose filter needs to see the whole domain
+        # subtree). Set explicitly only to override those defaults.
+        [System.DirectoryServices.SearchScope]$SearchScope
     )
     Begin {
-        function New-DNLdapFilter {
-            Param(
-                [string[]]$DN
-            )
-            $aResult = @()
-            $aResult += "(|"
-            foreach ($sDN in $DN) {
-                $aResult += "(distinguishedName=$sDN)"
-            }
-            $aResult += ")"
-            return ($aResult -join "")
-        }
-
+        # Resolve the DN list through Get-ADObject so the whole module has a SINGLE
+        # AD-object builder (object shape, Refresh(), PSTypeNames). DNs are grouped by
+        # domain so a multi-domain forest is queried once per domain; Get-ADObject's
+        # batch -Identity OR-s the per-DN clauses (it matches distinguishedName) into a
+        # single query per domain.
         $aGroupedDN = Group-DNByDomain -DNList $DN
         if ($Server -and ($aGroupedDN.Count -gt 1)) {
             throw "Can't specify server : there is more than one domain in the DN list"
         }
-        $aServerList = if ($Server) { $Server } else { $aGroupedDN.Keys }
-
         $aResults = @()
-        $defaultDisplaySet = 'distinguishedname','givenname','Name','objectclass','objectguid','samaccountname','objectsid','sn','userprincipalname'
-        $defaultDisplayPropertySet = New-Object System.Management.Automation.PSPropertySet('DefaultDisplayPropertySet',[string[]]$defaultDisplaySet)
-        $PSStandardMembers = [System.Management.Automation.PSMemberInfo[]]@($defaultDisplayPropertySet)
-
-        foreach ($sDomain in $aServerList) {
-            $sPath = if ($UseGlobalCatalog) { "GC://$sDomain" } else { "LDAP://$sDomain" }
-            $de = Connect-DirectoryEntry -Server $sPath -Credential $Credential
-            $ds = New-Object System.DirectoryServices.DirectorySearcher($de);
-
-            foreach ($sProperty in $Properties) {
-                $ds.PropertiesToLoad.Add($sProperty) | Out-Null
+        foreach ($oDomainGroup in $aGroupedDN.GetEnumerator()) {
+            $sDomain   = $oDomainGroup.Key
+            $aDomainDN = @($oDomainGroup.Value)
+            $hGetADObjectArgs = @{
+                Identity = $aDomainDN
+                Server   = if ($Server) { $Server } else { $sDomain }
             }
-            $ds.Filter = New-DNLdapFilter -DN $DN
-
-            $aADResults = $ds.FindAll()
-            $aGroupedADResults = $aADResults | Group-Object -Property Path -AsHashTable
-            if ($AdditionalProperties) {
-                $ds.PropertiesToLoad.Clear()
-                foreach ($sProperty in $AdditionalProperties) {
-                    $ds.PropertiesToLoad.Add($sProperty) | Out-Null
-                }
-                $aADResultsAdditionalProp = $ds.FindAll()
-            } else {
-                $aADResultsAdditionalProp = $null
+            if ($Properties)           { $hGetADObjectArgs.Properties = $Properties }
+            if ($AdditionalProperties) { $hGetADObjectArgs.AdditionalProperties = $AdditionalProperties }
+            if ($Credential)           { $hGetADObjectArgs.Credential = $Credential }
+            if ($UseGlobalCatalog)     { $hGetADObjectArgs.UseGlobalCatalog = $true }
+            # ContainsKey rather than "if ($SearchScope)": Base is enum 0
+            # (falsy). We only forward when the caller actually specified
+            # it, so Get-ADObject picks its per-mode default otherwise.
+            if ($PSBoundParameters.ContainsKey('SearchScope')) {
+                $hGetADObjectArgs.SearchScope = $SearchScope
             }
-            $aGroupedADAdditionalPropResults = if ($null -eq $aADResultsAdditionalProp) {
-                $null
-            } else {
-                $aADResultsAdditionalProp | Group-Object -Property Path -AsHashTable
-            }
-
-            foreach ($sADObjectPath in $aGroupedADResults.Keys) {
-                $hADObject = @{
-                    AdditionalProperties = @{
-                        Path = $sADObjectPath
-                        SearchResult = $aGroupedADResults[$sADObjectPath]
-                        AdditionalPropSearchResult = if ($AdditionalProperties) { $aGroupedADAdditionalPropResults[$sADObjectPath] } else { $null }
-                    }
-                }
-                foreach ($p in $hADObject.AdditionalProperties.SearchResult.Properties.Keys) {
-                    $oValue = $hADObject.AdditionalProperties.SearchResult.Properties[$p]
-                    if (($null -ne $oValue) -and ($oValue -ne @())) {
-                        $hADObject[$p] = Convert-ADObjectValue -Property $p -Value ($oValue)    
-                    } else {
-                        $hADObject[$p] = $null
-                    }
-                }
-                if ($AdditionalProperties) {
-                    $oAdditionalPropResult = $hADObject.AdditionalProperties.AdditionalPropSearchResult
-                    foreach ($p in $oAdditionalPropResult.Properties.Keys) {
-                        $hADObject[$p] = Convert-ADObjectValue -Property $p -Value ($oAdditionalPropResult.Properties[$p])
-                    }   
-                }
-                $oNewResult = New-Object -TypeName psobject -Property $hADObject
-                $oNewResult | Add-Member MemberSet PSStandardMembers $PSStandardMembers
-                $oNewResult.psobject.TypeNames.Insert(0, "AD" + $oNewResult.objectclass)
-                $aResults += $oNewResult 
+            # Per-domain isolation: an unreachable subdomain (RootDSE lookup fails,
+            # defaultNamingContext comes back empty and .ToString() on the missing
+            # value throws "cannot invoke method on a null-valued expression") must
+            # not abort the whole batch. A group with members split across several
+            # trusted domains still gets every reachable member; the unreachable
+            # ones are surfaced as one warning naming the domain and the DN count.
+            try {
+                $aResults += Get-ADObject @hGetADObjectArgs
+            } catch {
+                Write-Warning "Get-ADDNObject: domain '$sDomain' unreachable ($($aDomainDN.Count) DN(s) skipped) - $($_.Exception.Message)"
             }
         }
     }
